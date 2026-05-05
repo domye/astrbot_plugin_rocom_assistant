@@ -348,7 +348,7 @@ class HomeModule(BaseModule):
     
     async def _notify_plant(self, session_id: str, user_id: str, uid: str, ripe_count: int, growing_count: int):
         chain = MessageChain()
-        chain.at(qq=str(user_id)).message(f" 你的家园({uid})作物已成熟!\n种植园: 成熟: {ripe_count}株, 生长中: {growing_count}株")
+        chain.at(name="", qq=str(user_id)).message(f" 你的家园({uid})作物已成熟!\n种植园: 成熟: {ripe_count}株, 生长中: {growing_count}株")
         
         try:
             await self.context.send_message(session_id, chain)
@@ -363,7 +363,7 @@ class HomeModule(BaseModule):
             msg = f" 你的家园({uid})有精灵蛋待收取!\n室内: {', '.join(egg_names)}"
         
         chain = MessageChain()
-        chain.at(qq=str(user_id)).message(msg)
+        chain.at(name="", qq=str(user_id)).message(msg)
         
         try:
             await self.context.send_message(session_id, chain)
