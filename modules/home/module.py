@@ -34,6 +34,7 @@ class HomeModule(BaseModule):
         self._egg_timer: asyncio.Task = None
         self._running = False
         self._tracked_eggs: Dict[str, Set[str]] = {}
+        self._polling_tasks: Dict[str, asyncio.Task] = {}
     
     async def on_load(self):
         self.register_command("家园订阅", self._subscribe, "订阅家园种植提醒")
@@ -53,6 +54,8 @@ class HomeModule(BaseModule):
         
         if subs:
             self._start_egg_check_timer()
+            for sub in subs:
+                await self._check_eggs(sub)
     
     async def on_unload(self):
         self._running = False
@@ -224,9 +227,6 @@ class HomeModule(BaseModule):
         pets = self.api.extract_pets(home_info)
         egg_names = set(pet.get("name", "未知") for pet in pets if pet.get("have_egg"))
         self._tracked_eggs[key] = egg_names
-        
-        if egg_names:
-            await self._notify_egg(session_id, user_id, uid, list(egg_names), is_new=True)
     
     async def _plant_timer(self, session_id: str, user_id: str, uid: str, wait_seconds: int):
         try:
