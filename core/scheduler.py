@@ -9,13 +9,20 @@ from astrbot.api import logger
 
 
 class Scheduler:
-    _class_instance = None  # 类级别变量，不会被模块重载重置
+    # 类级别共享变量：多个实例共享执行记录和锁
+    _shared_executed_keys: Set[str] = set()
+    _shared_lock: asyncio.Lock = None  # 会在第一次使用时初始化
 
     def __init__(self):
         self._tasks: List[Tuple[str, List[str], Callable]] = []
         self._running = False
         self._task: asyncio.Task = None
-        self._executed_keys: Set[str] = set()  # 记录已执行的key
+
+    def _get_lock(self) -> asyncio.Lock:
+        """获取共享锁"""
+        if Scheduler._shared_lock is None:
+            Scheduler._shared_lock = asyncio.Lock()
+        return Scheduler._shared_lock
 
     def _cn_tz(self) -> timezone:
         return timezone(timedelta(hours=8))
@@ -46,29 +53,36 @@ class Scheduler:
         return f"{name}-{time_str}-{date.strftime('%Y-%m-%d')}"
 
     async def _run_handlers(self, now: datetime):
-        for name, times, handler in self._tasks:
-            for t in times:
-                pt = self._parse_time(t, now)
-                # 只匹配当前时间点（前60秒内），避免重复执行
-                if 0 <= (now - pt).total_seconds() < 60:
-                    exec_key = self._make_exec_key(name, t, now)
-                    if exec_key in self._executed_keys:
-                        logger.debug(f"[Scheduler] 跳过已执行任务: {exec_key}")
-                        continue
-                    try:
-                        logger.info(f"[Scheduler] 执行定时任务: {name}")
-                        await handler()
-                        self._executed_keys.add(exec_key)
-                    except Exception as e:
-                        logger.error(f"[Scheduler] 任务执行失败 {name}: {e}")
+        # 使用共享锁防止多个 scheduler 同时执行
+        lock = self._get_lock()
+        if lock.locked():
+            logger.debug("[Scheduler] 其他 scheduler 正在执行，跳过")
+            return
 
-        # 清理过期的执行记录（保留最近2天的）
-        today = now.strftime('%Y-%m-%d')
-        yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
-        self._executed_keys = {
-            k for k in self._executed_keys
-            if today in k or yesterday in k
-        }
+        async with lock:
+            for name, times, handler in self._tasks:
+                for t in times:
+                    pt = self._parse_time(t, now)
+                    # 只匹配当前时间点（前60秒内），避免重复执行
+                    if 0 <= (now - pt).total_seconds() < 60:
+                        exec_key = self._make_exec_key(name, t, now)
+                        if exec_key in Scheduler._shared_executed_keys:
+                            logger.debug(f"[Scheduler] 跳过已执行任务: {exec_key}")
+                            continue
+                        try:
+                            logger.info(f"[Scheduler] 执行定时任务: {name}")
+                            await handler()
+                            Scheduler._shared_executed_keys.add(exec_key)
+                        except Exception as e:
+                            logger.error(f"[Scheduler] 任务执行失败 {name}: {e}")
+
+            # 清理过期的执行记录（保留最近2天的）
+            today = now.strftime('%Y-%m-%d')
+            yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+            Scheduler._shared_executed_keys = {
+                k for k in Scheduler._shared_executed_keys
+                if today in k or yesterday in k
+            }
     
     async def _loop(self):
         while self._running:
@@ -100,31 +114,33 @@ class Scheduler:
                 await asyncio.sleep(60)
     
     def start(self):
-        global _global_scheduler_running, _global_scheduler_instance
-
-        # 检查自身是否已运行
         if self._running:
             logger.debug("[Scheduler] 当前实例已运行")
             return
 
-        # 停止旧的实例（如果存在且不是自己）
-        if _global_scheduler_instance and _global_scheduler_instance != self:
-            old_instance = _global_scheduler_instance
-            logger.info(f"[Scheduler] 停止旧的 scheduler 实例 (running={old_instance._running})")
-            old_instance._running = False
-            if old_instance._task and not old_instance._task.done():
-                old_instance._task.cancel()
-            _global_scheduler_running = False
+        # 检查是否有其他 scheduler 正在运行
+        try:
+            current_loop = asyncio.get_running_loop()
+            all_tasks = asyncio.all_tasks(current_loop)
+
+            scheduler_tasks = [
+                t for t in all_tasks
+                if t.get_name() == "scheduler_loop" and not t.done()
+            ]
+
+            if scheduler_tasks:
+                logger.warning(f"[Scheduler] 已有 scheduler 任务在运行，停止旧任务")
+                for t in scheduler_tasks:
+                    t.cancel()
+
+        except RuntimeError:
+            pass
 
         self._running = True
-        _global_scheduler_running = True
-        _global_scheduler_instance = self
-        self._task = asyncio.create_task(self._loop())
+        self._task = asyncio.create_task(self._loop(), name="scheduler_loop")
         logger.info(f"[Scheduler] 调度器已启动 (任务数: {len(self._tasks)})")
 
     async def stop(self):
-        global _global_scheduler_running, _global_scheduler_instance
-
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -132,9 +148,4 @@ class Scheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
-
-        if _global_scheduler_instance == self:
-            _global_scheduler_running = False
-            _global_scheduler_instance = None
-
         logger.info("[Scheduler] 调度器已停止")
