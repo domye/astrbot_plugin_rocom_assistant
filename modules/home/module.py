@@ -3,7 +3,7 @@
 """
 
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Set
 from datetime import datetime, timezone, timedelta
 
 from astrbot.api import logger
@@ -30,7 +30,9 @@ class HomeModule(BaseModule):
         self._plant_timers: Dict[str, asyncio.Task] = {}
         self._harvest_timers: Dict[str, asyncio.Task] = {}
         self._tracked_ripe: Dict[str, int] = {}  # 记录已提醒的成熟数量
+        self._notify_keys: Set[str] = set()  # 记录已发送提醒的key（防止重复）
         self._running = False
+        self._initialized = False  # 防止重复初始化
     
     async def on_load(self):
         self.register_command("家园订阅", self._subscribe, "订阅家园种植提醒")
@@ -42,6 +44,11 @@ class HomeModule(BaseModule):
         logger.info(f"[HomeModule] 模块加载完成")
     
     async def _init_subscriptions(self):
+        if self._initialized:
+            logger.warning("[HomeModule] 已初始化，跳过重复初始化")
+            return
+        self._initialized = True
+
         await asyncio.sleep(1)
 
         subs = await self.subscription.get_all_subscriptions()
@@ -262,7 +269,22 @@ class HomeModule(BaseModule):
 
     async def _notify_plant(self, session_id: str, user_id: str, uid: str, ripe_count: int, growing_count: int):
         key = self._sub_key(session_id, user_id)
+
+        # 生成提醒key（包含时间戳，每分钟一个key）
+        now = self._now_ts()
+        notify_key = f"{key}:{now // 60}"  # 按分钟去重
+
+        # 检查是否已发送过提醒
+        if notify_key in self._notify_keys:
+            logger.debug(f"[HomeModule] 跳过重复提醒: {notify_key}")
+            return
+
+        self._notify_keys.add(notify_key)
         self._tracked_ripe[key] = ripe_count
+
+        # 清理过期的提醒key（保留最近5分钟的）
+        cutoff = now // 60 - 5
+        self._notify_keys = {k for k in self._notify_keys if int(k.split(':')[-1]) > cutoff}
 
         chain = MessageChain()
         chain.at(name="", qq=str(user_id)).message(f" 你的家园({uid})作物已成熟!\n种植园: 成熟: {ripe_count}株, 生长中: {growing_count}株")

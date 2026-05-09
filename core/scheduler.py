@@ -4,7 +4,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Awaitable, List, Tuple
+from typing import Callable, Awaitable, List, Tuple, Set
 from astrbot.api import logger
 
 
@@ -13,11 +13,17 @@ class Scheduler:
         self._tasks: List[Tuple[str, List[str], Callable]] = []
         self._running = False
         self._task: asyncio.Task = None
-    
+        self._executed_keys: Set[str] = set()  # 记录已执行的key
+
     def _cn_tz(self) -> timezone:
         return timezone(timedelta(hours=8))
-    
+
     def register(self, name: str, times: List[str], handler: Callable[[], Awaitable[None]]):
+        # 检查是否已注册
+        for existing_name, _, _ in self._tasks:
+            if existing_name == name:
+                logger.warning(f"[Scheduler] 任务已存在，跳过重复注册: {name}")
+                return
         self._tasks.append((name, times, handler))
         logger.info(f"[Scheduler] 注册定时任务: {name}, 时间: {times}")
     
@@ -33,16 +39,34 @@ class Scheduler:
         next_day = now + timedelta(days=1)
         return self._parse_time(sorted(times)[0], next_day)
     
+    def _make_exec_key(self, name: str, time_str: str, date: datetime) -> str:
+        """生成唯一执行key: 任务名-时间-日期"""
+        return f"{name}-{time_str}-{date.strftime('%Y-%m-%d')}"
+
     async def _run_handlers(self, now: datetime):
         for name, times, handler in self._tasks:
             for t in times:
                 pt = self._parse_time(t, now)
-                if abs((now - pt).total_seconds()) < 60:
+                # 只匹配当前时间点（前60秒内），避免重复执行
+                if 0 <= (now - pt).total_seconds() < 60:
+                    exec_key = self._make_exec_key(name, t, now)
+                    if exec_key in self._executed_keys:
+                        logger.debug(f"[Scheduler] 跳过已执行任务: {exec_key}")
+                        continue
                     try:
                         logger.info(f"[Scheduler] 执行定时任务: {name}")
                         await handler()
+                        self._executed_keys.add(exec_key)
                     except Exception as e:
                         logger.error(f"[Scheduler] 任务执行失败 {name}: {e}")
+
+        # 清理过期的执行记录（保留最近2天的）
+        today = now.strftime('%Y-%m-%d')
+        yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+        self._executed_keys = {
+            k for k in self._executed_keys
+            if today in k or yesterday in k
+        }
     
     async def _loop(self):
         while self._running:
